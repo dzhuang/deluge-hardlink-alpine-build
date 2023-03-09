@@ -1,0 +1,12 @@
+FROM lscr.io/linuxserver/deluge:latest
+
+RUN mkdir -p /pkgs/apk
+COPY /pkgs /pkgs
+
+RUN \
+  apk add \
+		--no-cache \
+		--allow-untrusted /pkgs/apk/*/*.apk \
+  && site_package_path=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])') \
+  && mv /pkgs/*.egg $site_package_path/deluge/plugins/ \
+	&& rm -rf /pkgs \

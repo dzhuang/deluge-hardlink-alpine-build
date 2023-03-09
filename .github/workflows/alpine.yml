@@ -1,0 +1,136 @@
+name: BUILD ALPINE
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '!README.md'
+      - '**/**'
+  pull_request:
+    paths:
+      - '!README.md'
+      - '**/**'
+  workflow_dispatch:
+
+env:
+  # This file must ends with .patch
+  PATCH_FILE_NAME: "0001.patch"
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v3
+
+      - name: Prepare git dir
+        run: |
+          mkdir -p src
+
+      - name: Checkout Revision src
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          repository: dzhuang/deluge
+          ref: "${{ secrets.REVISION_BRANCH }}"
+          token: ${{ secrets.MY_TOKEN }}
+          path: src
+
+      - name: Set environment variable
+        working-directory: src
+        run: |
+          git fetch --tags origin
+
+          # echo $(git describe --tags --match deluge-[0-9]*)
+          echo $(git describe --tags --match deluge-[0-9]*)
+          export VERSION=$(python3 version.py)
+          echo $VERSION
+          if [[ $VERSION == *"dev"* ]]; then
+            echo "$VERSION is not a release version we would build on, terminating GitHub Action."
+            exit 1
+          else
+            BASED_ON_TAG_VERSION=${VERSION:0:5}
+          fi
+
+          echo "BASED_ON_TAG_VERSION=$BASED_ON_TAG_VERSION" >> $GITHUB_ENV
+
+          # Use this to generate release tag
+          tag_version=$(git describe --tags --abbrev=0 | sed 's/'deluge-'//')
+          abbrev_desc=$(git describe --tags --abbrev=0)
+          long_desc=$(git describe --tags --long)
+          revision=$(git describe --tags --long | sed 's/'"$abbrev_desc"'//' | sed 's/-/r/' | sed 's/-//')
+          BUILD_VERSION=$tag_version$revision
+          echo "BUILD_VERSION=$BUILD_VERSION" >> $GITHUB_ENV
+
+          # Generate Patch
+          git diff deluge-$BASED_ON_TAG_VERSION -- . ":(exclude).github" ":(exclude)README.md" > ../alpine/${{ env.PATCH_FILE_NAME }}
+
+          if [[ ${{ github.ref }} == 'refs/heads/main' ]]; then
+            echo "PUSH_IMAGE=true" >> $GITHUB_ENV
+          else
+            echo "PUSH_IMAGE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build alpine deluge
+        run : |
+
+          # build Docker base image
+          docker build --target=alpine-builder .
+          docker build --target=alpine-apk-builder --tag="build:alpine-apk-builder" --build-arg VERSION=${{ env.BASED_ON_TAG_VERSION }} --build-arg PATCH=${{ env.PATCH_FILE_NAME }} .
+
+          CONTAINER_ID="$(docker create "build:alpine-apk-builder")"
+          docker cp "${CONTAINER_ID}:/pkgs/" .
+          docker rm "${CONTAINER_ID}"
+
+          rm -rf pkgs/apk/x86_64/APKINDEX*
+          ls -l pkgs/apk/x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: alpine-packages
+          path: pkgs/apk/x86_64
+
+      - name: Create release
+        uses: marvinpinto/action-automatic-releases@latest
+        if: github.ref == 'refs/heads/main'
+        with:
+          prerelease: false
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: ${{ env.BUILD_VERSION }}
+          title: deluge-${{ env.BUILD_VERSION }} alpine/edge x86_64 with hardlink
+          files: |
+            pkgs/apk/x86_64/*
+
+      - name: Download Deluge YARSS2 plugin
+        run : |
+
+          wget -q https://bitbucket.org/bendikro/deluge-yarss-plugin/downloads/YaRSS2-2.1.5-py3.9.egg -O pkgs/YaRSS2-2.1.5-py3.11.egg
+          ls pkgs/
+
+      - name: Build & push Docker image
+        uses: mr-smithers-excellent/docker-build-push@v5
+        with:
+          image: ${{ secrets.DOCKER_USERNAME }}/docker-deluge
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          tags: ${{ env.BUILD_VERSION }}-hardlink, latest-hardlink
+          dockerfile: Dockerfile-deluge
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          pushImage: ${{ env.PUSH_IMAGE }}
+
+      # ref: https://github.com/orgs/community/discussions/26323#discussioncomment-3343871
+      - uses: actions/github-script@v6
+        name: Trigger remote actions
+        if: github.ref == 'refs/heads/main'
+        with:
+          github-token: ${{ secrets.MY_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: '${{ secrets.REMOTE_REPO_OWNER }}',
+              repo: '${{ secrets.REMOTE_REPO }}',
+              workflow_id: '${{ secrets.REMOTE_REPO_WORKFLOW_ID }}',
+              ref: '${{ secrets.REMOTE_REPO_BRANCH }}'
+            })
